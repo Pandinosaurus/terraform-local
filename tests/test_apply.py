@@ -3,10 +3,18 @@ import random
 import subprocess
 import tempfile
 import uuid
+import json
 from typing import Dict, Generator
+from shutil import rmtree
+from packaging import version
+
 
 import boto3
 import pytest
+import hcl2
+
+# TODO set up the tests to run with tox so we can run the tests with different python versions
+
 
 THIS_PATH = os.path.abspath(os.path.dirname(__file__))
 ROOT_PATH = os.path.join(THIS_PATH, "..")
@@ -52,12 +60,11 @@ def test_access_key_override_by_profile(monkeypatch, profile_name: str):
     monkeypatch.setenv("CUSTOMIZE_ACCESS_KEY", "1")
     access_key = mock_access_key()
     bucket_name = short_uid()
-    credentials = """
-    [%s]
-    aws_access_key_id = %s
-    aws_secret_access_key = test
-    region = eu-west-1
-    """ % (profile_name, access_key)
+    credentials = """[%s]
+aws_access_key_id = %s
+aws_secret_access_key = test
+region = eu-west-1
+""" % (profile_name, access_key)
     with tempfile.TemporaryDirectory() as temp_dir:
         credentials_file = os.path.join(temp_dir, "credentials")
         with open(credentials_file, "w") as f:
@@ -94,7 +101,9 @@ def test_access_key_override_by_provider(monkeypatch):
 
 
 def test_s3_path_addressing():
-    bucket_name = f"bucket.{short_uid()}"
+    # Temporarily change "." -> "-" as aws provider >5.55.0 fails with LocalStack
+    # by calling aws-global pseudo region at S3 bucket creation instead of us-east-1
+    bucket_name = f"bucket-{short_uid()}"
     config = """
     resource "aws_s3_bucket" "test-bucket" {
       bucket = "%s"
@@ -159,7 +168,9 @@ def test_provider_aliases():
 def test_s3_backend():
     state_bucket = f"tf-state-{short_uid()}"
     state_table = f"tf-state-{short_uid()}"
-    bucket_name = f"bucket.{short_uid()}"
+    # Temporarily change "." -> "-" as aws provider >5.55.0 fails with LocalStack
+    # by calling aws-global pseudo region at S3 bucket creation instead of us-east-1
+    bucket_name = f"bucket-{short_uid()}"
     config = """
     terraform {
       backend "s3" {
@@ -194,19 +205,266 @@ def test_s3_backend():
     assert result["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
+def test_dry_run(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "1")
+    state_bucket = "tf-state-dry-run"
+    state_table = "tf-state-dry-run"
+    # Temporarily change "." -> "-" as aws provider >5.55.0 fails with LocalStack
+    # by calling aws-global pseudo region at S3 bucket creation instead of us-east-1
+    bucket_name = "bucket-dry-run"
+    config = """
+    terraform {
+      backend "s3" {
+        bucket = "%s"
+        key    = "terraform.tfstate"
+        dynamodb_table = "%s"
+        region = "us-east-2"
+        skip_credentials_validation = true
+      }
+    }
+    resource "aws_s3_bucket" "test-bucket" {
+      bucket = "%s"
+    }
+    """ % (state_bucket, state_table, bucket_name)
+    is_legacy_tf = is_legacy_tf_version(get_version())
+
+    temp_dir = deploy_tf_script(config, cleanup=False, user_input="yes")
+    override_file = os.path.join(temp_dir, "localstack_providers_override.tf")
+    assert check_override_file_exists(override_file)
+
+    assert check_override_file_backend_endpoints_content(override_file, is_legacy=is_legacy_tf)
+
+    # assert that bucket with state file exists
+    s3 = client("s3", region_name="us-east-2")
+
+    with pytest.raises(s3.exceptions.NoSuchBucket):
+        s3.list_objects(Bucket=state_bucket)
+
+    # assert that DynamoDB table with state file locks exists
+    dynamodb = client("dynamodb", region_name="us-east-2")
+    with pytest.raises(dynamodb.exceptions.ResourceNotFoundException):
+        dynamodb.describe_table(TableName=state_table)
+
+    # assert that S3 resource has been created
+    s3 = client("s3")
+    with pytest.raises(s3.exceptions.ClientError):
+        s3.head_bucket(Bucket=bucket_name)
+
+
+def test_service_endpoint_alias_replacements(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "1")
+    config = """
+    provider "aws" {
+      region = "eu-west-1"
+    }"""
+
+    temp_dir = deploy_tf_script(config, cleanup=False, user_input="yes")
+    override_file = os.path.join(temp_dir, "localstack_providers_override.tf")
+    assert check_override_file_content(override_file)
+    rmtree(temp_dir)
+
+
+def check_override_file_content(override_file):
+    try:
+        with open(override_file, "r") as fp:
+            result = hcl2.load(fp)
+            result = result["provider"][0]["aws"]
+    except Exception as e:
+        raise Exception(f'Unable to parse "{override_file}" as HCL file: {e}')
+
+    endpoints = result["endpoints"][0]
+    if "config" in endpoints and "configservice" in endpoints:
+        return False
+    return True
+
+
+def test_s3_backend_configs_merge(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "1")
+    state_bucket = "tf-state-conf-merge"
+    state_table = "tf-state-conf-merge"
+    # Temporarily change "." -> "-" as aws provider >5.55.0 fails with LocalStack
+    # by calling aws-global pseudo region at S3 bucket creation instead of us-east-1
+    bucket_name = "bucket-conf-merge"
+    config = """
+    terraform {
+      backend "s3" {
+        bucket = "%s"
+        key    = "terraform.tfstate"
+        dynamodb_table = "%s"
+        region = "us-east-2"
+        skip_credentials_validation = true
+        encryption = true
+        use_path_style = true
+        acl = "bucket-owner-full-control"
+        shared_config_files = ["~/.aws/config","~/other/config"]
+      }
+    }
+    resource "aws_s3_bucket" "test-bucket" {
+      bucket = "%s"
+    }
+    """ % (state_bucket, state_table, bucket_name)
+    temp_dir = deploy_tf_script(config, cleanup=False, user_input="yes")
+    override_file = os.path.join(temp_dir, "localstack_providers_override.tf")
+    assert check_override_file_exists(override_file)
+    assert check_override_file_backend_extra_content(override_file)
+    rmtree(temp_dir)
+
+
+def check_override_file_backend_extra_content(override_file):
+    try:
+        with open(override_file, "r") as fp:
+            result = hcl2.load(fp)
+            result = result["terraform"][0]["backend"][0]["s3"]
+    except Exception as e:
+        raise Exception(f'Unable to parse "{override_file}" as HCL file: {e}')
+
+    return result.get("use_path_style") is True and \
+        result.get("encryption") is True and \
+        result.get("acl") == "bucket-owner-full-control" and \
+        isinstance(result.get("shared_config_files"), list) and \
+        len(result.get("shared_config_files")) == 2
+
+
+@pytest.mark.parametrize("endpoints", [
+    '',
+    'endpoint = "http://s3-localhost.localstack.cloud:4566"',
+    'endpoints = { "s3": "http://s3-localhost.localstack.cloud:4566" }',
+    '''
+    endpoint = "http://localhost-s3.localstack.cloud:4566"
+    endpoints = { "s3": "http://s3-localhost.localstack.cloud:4566" }
+    '''])
+def test_s3_backend_endpoints_merge(monkeypatch, endpoints: str):
+    monkeypatch.setenv("DRY_RUN", "1")
+    state_bucket = "tf-state-merge"
+    state_table = "tf-state-merge"
+    # Temporarily change "." -> "-" as aws provider >5.55.0 fails with LocalStack
+    # by calling aws-global pseudo region at S3 bucket creation instead of us-east-1
+    bucket_name = "bucket-merge"
+    config = """
+    terraform {
+      backend "s3" {
+        bucket = "%s"
+        key    = "terraform.tfstate"
+        dynamodb_table = "%s"
+        region = "us-east-2"
+        skip_credentials_validation = true
+        %s
+      }
+    }
+    resource "aws_s3_bucket" "test-bucket" {
+      bucket = "%s"
+    }
+    """ % (state_bucket, state_table, endpoints, bucket_name)
+    is_legacy_tf = is_legacy_tf_version(get_version())
+    if is_legacy_tf and endpoints not in ("", 'endpoint = "http://s3-localhost.localstack.cloud:4566"'):
+        with pytest.raises(subprocess.CalledProcessError):
+            deploy_tf_script(config, user_input="yes")
+    else:
+        temp_dir = deploy_tf_script(config, cleanup=False, user_input="yes")
+        override_file = os.path.join(temp_dir, "localstack_providers_override.tf")
+        assert check_override_file_exists(override_file)
+        assert check_override_file_backend_endpoints_content(override_file, is_legacy=is_legacy_tf)
+        rmtree(temp_dir)
+
+
+def check_override_file_exists(override_file):
+    return os.path.isfile(override_file)
+
+
+def check_override_file_backend_endpoints_content(override_file, is_legacy: bool = False):
+    legacy_options = (
+        "endpoint",
+        "iam_endpoint",
+        "dynamodb_endpoint",
+        "sts_endpoint",
+    )
+    new_options = (
+        "iam",
+        "dynamodb",
+        "s3",
+        "sso",
+        "sts",
+    )
+    try:
+        with open(override_file, "r") as fp:
+            result = hcl2.load(fp)
+            result = result["terraform"][0]["backend"][0]["s3"]
+    except Exception as e:
+        print(f'Unable to parse "{override_file}" as HCL file: {e}')
+
+    new_options_check = "endpoints" in result and all(map(lambda x: x in result.get("endpoints"), new_options))
+
+    if is_legacy:
+        legacy_options_check = all(map(lambda x: x in result, legacy_options))
+        return not new_options_check and legacy_options_check
+
+    legacy_options_check = any(map(lambda x: x in result, legacy_options))
+    return new_options_check and not legacy_options_check
+
+
+def test_provider_aliases_ignored(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "1")
+    config = """
+    provider "aws" {
+      region = "eu-west-1"
+    }
+    provider "aws" {
+      alias      = "us_east_2"
+      region     = "us-east-2"
+      secret_key = "not-overriden"
+    }
+    """
+
+    temp_dir = deploy_tf_script(config, cleanup=False, env_vars={"SKIP_ALIASES": "us_east_2"}, user_input="yes")
+    override_file = os.path.join(temp_dir, "localstack_providers_override.tf")
+    assert check_override_file_content_for_alias(override_file)
+    rmtree(temp_dir)
+
+
+def check_override_file_content_for_alias(override_file):
+    try:
+        with open(override_file, "r") as fp:
+            result = hcl2.load(fp)
+            result = result["provider"]
+    except Exception as e:
+        raise Exception(f'Unable to parse "{override_file}" as HCL file: {e}')
+
+    for p in result:
+        if "aws" in p and "alias" in p["aws"] and p["aws"]["alias"] == "us_east_2":
+            return False
+    return True
+
+
 ###
 # UTIL FUNCTIONS
 ###
 
-def deploy_tf_script(script: str, env_vars: Dict[str, str] = None):
-    with tempfile.TemporaryDirectory() as temp_dir:
+
+def is_legacy_tf_version(tf_version, legacy_version: str = "1.6") -> bool:
+    """Check if Terraform version is legacy"""
+    if tf_version < version.Version(legacy_version):
+        return True
+    return False
+
+
+def get_version():
+    """Get Terraform version"""
+    output = run([TFLOCAL_BIN, "version", "-json"]).decode("utf-8")
+    return version.parse(json.loads(output)["terraform_version"])
+
+
+def deploy_tf_script(script: str, cleanup: bool = True, env_vars: Dict[str, str] = None, user_input: str = None):
+    # TODO the delete keyword was added in python 3.12, and the README and setup.cfg claims compatibility with earlier python versions
+    with tempfile.TemporaryDirectory(delete=cleanup) as temp_dir:
         with open(os.path.join(temp_dir, "test.tf"), "w") as f:
             f.write(script)
         kwargs = {"cwd": temp_dir}
+        if user_input:
+            kwargs.update({"input": bytes(user_input, "utf-8")})
         kwargs["env"] = {**os.environ, **(env_vars or {})}
         run([TFLOCAL_BIN, "init"], **kwargs)
-        out = run([TFLOCAL_BIN, "apply", "-auto-approve"], **kwargs)
-        return out
+        run([TFLOCAL_BIN, "apply", "-auto-approve"], **kwargs)
+        return temp_dir
 
 
 def get_bucket_names(**kwargs: dict) -> list:
